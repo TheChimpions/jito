@@ -416,11 +416,9 @@ impl BundleConsumer {
                 .iter()
                 .zip(batch.sanitized_transactions())
                 .filter_map(|(processing_result, tx)| {
-                    if processing_result.was_processed() {
-                        Some(tx.to_versioned_transaction())
-                    } else {
-                        None
-                    }
+                    processing_result
+                        .was_processed()
+                        .then(|| tx.to_versioned_transaction())
                 })
                 .collect_vec()
         );
@@ -428,11 +426,12 @@ impl BundleConsumer {
         let (freeze_lock, freeze_lock_us) = measure_us!(bank.freeze_lock());
         execute_and_commit_timings.freeze_lock_us = freeze_lock_us;
 
-        // BundleStage: executes multiple transactions which may contain overlapping accounts
-        // This needs to happen until the relax_intrabatch_account_locks feature is enabled
+        // SIMD-0083 (`relax_intrabatch_account_locks`) allows a single PoH entry
+        // to contain transactions that share writable accounts, so the entire
+        // bundle is recorded as one entry instead of one entry per transaction.
         let (record_transactions_summary, record_us) = measure_us!(
             self.transaction_recorder
-                .record_bundle(bank.bank_id(), processed_transactions)
+                .record_transactions(bank.bank_id(), processed_transactions)
         );
         execute_and_commit_timings.record_us = record_us;
 
@@ -545,7 +544,10 @@ mod tests {
         solana_poh::{record_channels::record_channels, transaction_recorder::TransactionRecorder},
         solana_pubkey::{Pubkey, new_rand},
         solana_runtime::{bank::Bank, prioritization_fee_cache::PrioritizationFeeCache},
-        solana_runtime_transaction::runtime_transaction::RuntimeTransaction,
+        solana_runtime_transaction::{
+            runtime_transaction::RuntimeTransaction,
+            transaction_with_meta::TransactionWithMeta,
+        },
         solana_signer::Signer,
         solana_system_transaction::transfer,
         solana_transaction::{
@@ -847,6 +849,25 @@ mod tests {
             commit_transactions_result[2],
             CommitTransactionDetails::Committed { result: Ok(_), .. }
         );
+
+        // SIMD-0083 regression guard: the three chained transfers (which share
+        // writable locks on `kp1` and `kp2`) must land in a single PoH entry
+        // instead of one entry per transaction.
+        record_receiver.shutdown();
+        let records = record_receiver.drain().collect::<Vec<_>>();
+        assert_eq!(records.len(), 1, "expected exactly one Record");
+        let record = &records[0];
+        assert_eq!(
+            record.transaction_batches.len(),
+            1,
+            "expected one PoH entry containing the whole bundle"
+        );
+        assert_eq!(record.mixins.len(), 1);
+        let recorded_batch = &record.transaction_batches[0];
+        assert_eq!(recorded_batch.len(), transactions.len());
+        for (recorded, expected) in recorded_batch.iter().zip(transactions.iter()) {
+            assert_eq!(recorded, &expected.to_versioned_transaction());
+        }
     }
 
     #[test]

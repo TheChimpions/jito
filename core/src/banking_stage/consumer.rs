@@ -9,12 +9,10 @@ use {
         bundle_stage::bundle_account_locker::BundleAccountLocker,
         proxy::block_engine_stage::BlockBuilderFeeInfo, tip_manager::TipManager,
     },
-    ahash::AHashSet,
     arc_swap::ArcSwap,
     itertools::Itertools,
     solana_accounts_db::accounts::TransactionAccountLocksIterator,
     solana_clock::MAX_PROCESSING_AGE,
-    solana_entry::entry::hash_transactions,
     solana_fee::FeeFeatures,
     solana_fee_structure::FeeBudgetLimits,
     solana_gossip::cluster_info::ClusterInfo,
@@ -25,7 +23,6 @@ use {
             RecordTransactionsSummary, RecordTransactionsTimings, TransactionRecorder,
         },
     },
-    solana_pubkey::Pubkey,
     solana_runtime::{
         bank::{Bank, LoadAndExecuteTransactionsOutput},
         transaction_batch::TransactionBatch,
@@ -37,11 +34,9 @@ use {
         transaction_processing_result::TransactionProcessingResultExtensions,
         transaction_processor::{ExecutionRecordingConfig, TransactionProcessingConfig},
     },
-    solana_transaction::versioned::VersionedTransaction,
     solana_transaction_error::TransactionError,
     solana_vote::vote_parser,
     std::{
-        cell::Cell,
         num::Saturating,
         sync::{Arc, Mutex},
     },
@@ -131,24 +126,6 @@ pub struct Consumer {
     transaction_recorder: TransactionRecorder,
     qos_service: QosService,
     log_messages_bytes_limit: Option<usize>,
-    seq_not_conflict_batch_reusables: Cell<SeqNotConflictBatchReusables>,
-}
-
-#[derive(Default)]
-struct SeqNotConflictBatchReusables {
-    aggregate_write_locks: AHashSet<Pubkey>,
-    aggregate_read_locks: AHashSet<Pubkey>,
-    transaction_write_locks: Vec<Pubkey>,
-    transaction_read_locks: Vec<Pubkey>,
-}
-
-impl SeqNotConflictBatchReusables {
-    pub fn clear(&mut self) {
-        self.aggregate_write_locks.clear();
-        self.aggregate_read_locks.clear();
-        self.transaction_write_locks.clear();
-        self.transaction_read_locks.clear();
-    }
 }
 
 impl Consumer {
@@ -163,7 +140,6 @@ impl Consumer {
             transaction_recorder,
             qos_service,
             log_messages_bytes_limit,
-            seq_not_conflict_batch_reusables: Cell::new(SeqNotConflictBatchReusables::default()),
         }
     }
 
@@ -522,41 +498,26 @@ impl Consumer {
             attempted_processing_count: processing_results.len() as u64,
         };
 
-        let processed_transactions = processing_results
+        let (processed_transactions, prepare_record_transactions_us) = measure_us!(processing_results
             .iter()
             .zip(batch.sanitized_transactions())
             .filter_map(|(processing_result, tx)| {
-                if processing_result.was_processed() {
-                    Some((tx.to_versioned_transaction(), tx))
-                } else {
-                    None
-                }
+                processing_result
+                    .was_processed()
+                    .then(|| tx.to_versioned_transaction())
             })
-            .collect_vec();
+            .collect_vec());
 
         let (freeze_lock, freeze_lock_us) = measure_us!(bank.freeze_lock());
         execute_and_commit_timings.freeze_lock_us = freeze_lock_us;
 
-        let mut reusables = self.seq_not_conflict_batch_reusables.take();
-
-        // Entries do **not** yet support conflicting transactions. To get around this we create
-        // lists of transactions that are non-conflicting to shred out into entries. If we don't do
-        // this, then blocks are rejected by consensus/replay.
-        let (batches, prepare_record_transactions_us) =
-            measure_us!(Self::create_sequential_non_conflicting_batches(
-                &mut reusables,
-                processed_transactions.into_iter()
-            ));
-        self.seq_not_conflict_batch_reusables.set(reusables);
-        let hashes = batches
-            .iter()
-            .map(|batch| hash_transactions(batch))
-            .collect::<Vec<_>>();
-
-        let (record_transactions_summary, record_us) = measure_us!(
-            self.transaction_recorder
-                .record_batch(bank.bank_id(), hashes, batches)
-        );
+        // SIMD-0083 (`relax_intrabatch_account_locks`) allows a single entry to
+        // contain transactions with conflicting account locks, so we can record
+        // every processed transaction as a single PoH entry instead of first
+        // splitting them into non-conflicting sub-batches.
+        let (record_transactions_summary, record_us) = measure_us!(self
+            .transaction_recorder
+            .record_transactions(bank.bank_id(), processed_transactions));
         execute_and_commit_timings.record_us = record_us;
 
         let RecordTransactionsSummary {
@@ -648,61 +609,6 @@ impl Consumer {
             min_prioritization_fees,
             max_prioritization_fees,
         }
-    }
-
-    fn create_sequential_non_conflicting_batches<'a, T: TransactionWithMeta + 'a>(
-        reusables: &mut SeqNotConflictBatchReusables,
-        processed_transactions: impl Iterator<Item = (VersionedTransaction, &'a T)>,
-    ) -> Vec<Vec<VersionedTransaction>> {
-        let mut result = vec![];
-        let mut current_batch = vec![];
-        reusables.clear();
-        let SeqNotConflictBatchReusables {
-            aggregate_write_locks,
-            aggregate_read_locks,
-            transaction_write_locks,
-            transaction_read_locks,
-        } = reusables;
-
-        for (transaction, transaction_info) in processed_transactions {
-            transaction_write_locks.clear();
-            transaction_read_locks.clear();
-            let mut has_contention = false;
-            for (key, writable) in
-                TransactionAccountLocksIterator::new(transaction_info).accounts_with_is_writable()
-            {
-                if writable {
-                    transaction_write_locks.push(*key);
-                } else {
-                    transaction_read_locks.push(*key);
-                }
-
-                if !has_contention
-                    && (aggregate_write_locks.contains(key)
-                        || (writable && aggregate_read_locks.contains(key)))
-                {
-                    has_contention = true;
-                }
-            }
-
-            if has_contention {
-                result.push(std::mem::replace(
-                    &mut current_batch,
-                    Vec::with_capacity(TARGET_NUM_TRANSACTIONS_PER_BATCH),
-                ));
-                aggregate_write_locks.clear();
-                aggregate_read_locks.clear();
-            }
-            current_batch.push(transaction);
-            aggregate_write_locks.extend(transaction_write_locks.drain(..));
-            aggregate_read_locks.extend(transaction_read_locks.drain(..));
-        }
-
-        if !current_batch.is_empty() {
-            result.push(current_batch);
-        }
-
-        result
     }
 
     pub fn check_fee_payer_unlocked(
@@ -1894,43 +1800,71 @@ mod tests {
         );
     }
 
+    // SIMD-0083 regression guard: multiple processed transactions, including
+    // ones that share a writable account, must be recorded to PoH as a single
+    // entry rather than being split into non-conflicting sub-batches.
     #[test]
-    fn test_create_sequential_non_conflicting_batches() {
-        let a = Pubkey::new_unique();
-        let b = Pubkey::new_unique();
-        let c = Pubkey::new_unique();
-        let d = Pubkey::new_unique();
-        let txns = vec![
-            Transaction::new_unsigned(Message::new(
-                &[system_instruction::transfer(&a, &b, 1)],
-                Some(&Pubkey::new_unique()),
-            )),
-            Transaction::new_unsigned(Message::new(
-                &[system_instruction::transfer(&d, &d, 1)],
-                Some(&Pubkey::new_unique()),
-            )),
-            Transaction::new_unsigned(Message::new(
-                &[system_instruction::transfer(&b, &c, 1)],
-                Some(&Pubkey::new_unique()),
-            )),
+    fn test_process_and_record_transactions_records_single_entry() {
+        let TestFrame {
+            mint_keypair,
+            bank,
+            bank_forks: _bank_forks,
+            mut record_receiver,
+            consumer,
+        } = setup_test(true, None);
+
+        // Three transfers from the same fee payer; all three share a writable
+        // lock on `mint_keypair`, so under the pre-SIMD-0083 path they would be
+        // forced into three separate entries by `create_sequential_non_conflicting_batches`.
+        let recipients = [
+            solana_pubkey::new_rand(),
+            solana_pubkey::new_rand(),
+            solana_pubkey::new_rand(),
         ];
-        let txn_infos = txns
-            .iter()
-            .map(|tx| RuntimeTransaction::from_transaction_for_tests(tx.clone()))
-            .collect::<Vec<_>>();
-        let txns = txns
-            .into_iter()
-            .map(VersionedTransaction::from)
-            .collect::<Vec<_>>();
-        let mut reusables = SeqNotConflictBatchReusables::default();
-        let batches = Consumer::create_sequential_non_conflicting_batches(
-            &mut reusables,
-            txns.into_iter().zip(txn_infos.iter()),
+        let transactions = sanitize_transactions(
+            recipients
+                .iter()
+                .map(|recipient| {
+                    system_transaction::transfer(
+                        &mint_keypair,
+                        recipient,
+                        1,
+                        bank.last_blockhash(),
+                    )
+                })
+                .collect(),
         );
 
-        // Expect 2 batches: one with len=2 (a,b,c), and one with len=1 (d)
-        assert_eq!(batches.len(), 2);
-        assert_eq!(batches[0].len(), 2);
-        assert_eq!(batches[1].len(), 1);
+        let output = consumer.process_and_record_transactions(
+            &bank,
+            &transactions,
+            &BundleAccountLocker::default(),
+            false,
+        );
+        let ExecuteAndCommitTransactionsOutput {
+            transaction_counts,
+            commit_transactions_result,
+            ..
+        } = output.execute_and_commit_transactions_output;
+        assert_eq!(transaction_counts.processed_with_successful_result_count, 3);
+        assert!(commit_transactions_result.is_ok());
+
+        // Drain PoH records and assert the three txs live in a single entry.
+        record_receiver.shutdown();
+        let records = record_receiver.drain().collect::<Vec<_>>();
+        assert_eq!(records.len(), 1, "expected exactly one Record");
+        let record = &records[0];
+        assert_eq!(record.bank_id, bank.bank_id());
+        assert_eq!(
+            record.transaction_batches.len(),
+            1,
+            "expected one PoH entry containing all txs"
+        );
+        assert_eq!(record.mixins.len(), 1);
+        let recorded_batch = &record.transaction_batches[0];
+        assert_eq!(recorded_batch.len(), transactions.len());
+        for (recorded, expected) in recorded_batch.iter().zip(transactions.iter()) {
+            assert_eq!(recorded, &expected.to_versioned_transaction());
+        }
     }
 }
