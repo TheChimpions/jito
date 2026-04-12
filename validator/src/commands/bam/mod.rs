@@ -62,16 +62,7 @@ pub fn normalize_bam_url(url_str: &str) -> Result<String, BamUrlError> {
             })?;
     }
 
-    let mut normalized = url.to_string();
-    if !url_str.ends_with('/')
-        && url.path() == "/"
-        && url.query().is_none()
-        && url.fragment().is_none()
-    {
-        normalized.pop();
-    }
-
-    Ok(normalized)
+    Ok(url.to_string())
 }
 
 /// Extract and validate BAM URL from command line arguments.
@@ -169,31 +160,31 @@ mod tests {
     }
 
     // HTTP with port
-    #[test_case("http://localhost:8080", "http://localhost:8080" ; "http localhost with port")]
-    #[test_case("http://your-bam.host.wtf:8080", "http://your-bam.host.wtf:8080" ; "http domain with port")]
-    #[test_case("http://oh.bam:8080", "http://oh.bam:8080" ; "http short domain with port")]
+    #[test_case("http://localhost:8080", "http://localhost:8080/" ; "http localhost with port")]
+    #[test_case("http://your-bam.host.wtf:8080", "http://your-bam.host.wtf:8080/" ; "http domain with port")]
+    #[test_case("http://oh.bam:8080", "http://oh.bam:8080/" ; "http short domain with port")]
     #[test_case("http://bam:8080/badam", "http://bam:8080/badam" ; "http with port and path")]
     #[test_case("http://bam:8080/dot/slash/", "http://bam:8080/dot/slash/" ; "http with port and path preserving slash")]
     #[test_case("http://192.168.100.42:8080/ba/da/m", "http://192.168.100.42:8080/ba/da/m" ; "http ipv4 with port and path")]
     #[test_case("http://[fe80::1]:8080/ba/da/m", "http://[fe80::1]:8080/ba/da/m" ; "http ipv6 with port and path")]
     // HTTPS with port
-    #[test_case("https://localhost:8081", "https://localhost:8081" ; "https localhost with port")]
-    #[test_case("https://your-bam.host.wtf:8081", "https://your-bam.host.wtf:8081" ; "https domain with port")]
-    #[test_case("https://oh.bam:8081", "https://oh.bam:8081" ; "https short domain with port")]
+    #[test_case("https://localhost:8081", "https://localhost:8081/" ; "https localhost with port")]
+    #[test_case("https://your-bam.host.wtf:8081", "https://your-bam.host.wtf:8081/" ; "https domain with port")]
+    #[test_case("https://oh.bam:8081", "https://oh.bam:8081/" ; "https short domain with port")]
     #[test_case("https://bam:8081/badam", "https://bam:8081/badam" ; "https with port and path")]
     #[test_case("https://192.168.100.42:8081/ba/da/m", "https://192.168.100.42:8081/ba/da/m" ; "https ipv4 with port and path")]
     #[test_case("https://[fe80::1]:8081/ba/da/m", "https://[fe80::1]:8081/ba/da/m" ; "https ipv6 with port and path")]
     // No scheme with port (should default to http)
-    #[test_case("localhost:8080", "http://localhost:8080" ; "localhost with port defaults to http")]
-    #[test_case("your-bam.host.wtf:8080", "http://your-bam.host.wtf:8080" ; "domain with port defaults to http")]
-    #[test_case("oh.bam:8080", "http://oh.bam:8080" ; "short domain with port defaults to http")]
+    #[test_case("localhost:8080", "http://localhost:8080/" ; "localhost with port defaults to http")]
+    #[test_case("your-bam.host.wtf:8080", "http://your-bam.host.wtf:8080/" ; "domain with port defaults to http")]
+    #[test_case("oh.bam:8080", "http://oh.bam:8080/" ; "short domain with port defaults to http")]
     #[test_case("bam:8080/badam", "http://bam:8080/badam" ; "host with port and path defaults to http")]
     #[test_case("192.168.100.42:8080/ba/da/m", "http://192.168.100.42:8080/ba/da/m" ; "ipv4 with port and path defaults to http")]
     #[test_case("[fe80::1]:8080/ba/da/m", "http://[fe80::1]:8080/ba/da/m" ; "ipv6 with port and path defaults to http")]
     // No scheme without port (should default to http with default port 50055)
-    #[test_case("localhost", "http://localhost:50055" ; "localhost defaults to http with default port")]
-    #[test_case("your-bam.host.wtf", "http://your-bam.host.wtf:50055" ; "domain defaults to http with default port")]
-    #[test_case("oh.bam", "http://oh.bam:50055" ; "short domain defaults to http with default port")]
+    #[test_case("localhost", "http://localhost:50055/" ; "localhost defaults to http with default port")]
+    #[test_case("your-bam.host.wtf", "http://your-bam.host.wtf:50055/" ; "domain defaults to http with default port")]
+    #[test_case("oh.bam", "http://oh.bam:50055/" ; "short domain defaults to http with default port")]
     #[test_case("bam/badam", "http://bam:50055/badam" ; "host with path defaults to http with default port")]
     #[test_case("192.168.100.42/ba/da/m", "http://192.168.100.42:50055/ba/da/m" ; "ipv4 with path defaults to http with default port")]
     #[test_case("[fe80::1]/ba/da/m", "http://[fe80::1]:50055/ba/da/m" ; "ipv6 with path defaults to http with default port")]
