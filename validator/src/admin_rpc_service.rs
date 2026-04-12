@@ -1,5 +1,8 @@
 use {
-    crate::shred_receiver_addresses::parse_shred_receiver_addresses,
+    crate::{
+        commands::bam::normalize_bam_url,
+        shred_receiver_addresses::parse_shred_receiver_addresses,
+    },
     arc_swap::ArcSwap,
     crossbeam_channel::Sender,
     jsonrpc_core::{BoxFuture, ErrorCode, MetaIoHandler, Metadata, Result},
@@ -620,6 +623,13 @@ impl AdminRpc for AdminRpcImpl {
         let bam_url = bam_url.filter(|url| !url.trim().is_empty());
         let old_bam_url = meta.bam_url.load();
         debug!("set_bam_url old= {old_bam_url:?}, new={bam_url:?}");
+
+        let bam_url = bam_url
+            .map(|url| normalize_bam_url(&url))
+            .transpose()
+            .map_err(|e| {
+                jsonrpc_core::error::Error::invalid_params(format!("Invalid BAM URL: {e}"))
+            })?;
 
         if let Some(new_bam_url) = &bam_url {
             Endpoint::from_str(new_bam_url).map_err(|e| {
@@ -1618,21 +1628,18 @@ mod tests {
             r#"{"jsonrpc":"2.0","id":1,"method":"setBamUrl","params":["not a url"]}"#;
         let response = test_validator.handle_request(set_bad_string_bam_url_request);
 
-        let expected_error_response: Value = serde_json::from_str(
-            r#"{
-                "id": 1,
-                "jsonrpc": "2.0",
-                "error": {
-                    "code": -32602,
-                    "message": "Could not create endpoint: invalid URI"
-                }
-            }"#,
-        )
-        .expect("Failed to parse expected error response");
         let actual_error_response: Value =
             serde_json::from_str(&response.expect("actual response"))
                 .expect("actual response deserialization");
-        assert_eq!(actual_error_response, expected_error_response);
+        assert_eq!(actual_error_response["error"]["code"], -32602);
+        assert!(
+            actual_error_response["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("Invalid BAM URL"),
+            "Expected 'Invalid BAM URL' in error message, got: {}",
+            actual_error_response["error"]["message"]
+        );
 
         let disable_bam_url_request =
             r#"{"jsonrpc":"2.0","id":1,"method":"setBamUrl","params":[null]}"#;

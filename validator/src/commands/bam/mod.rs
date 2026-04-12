@@ -32,7 +32,7 @@ const DEFAULT_BAM_HTTPS_PORT: u16 = 50056;
 ///
 /// # Errors
 /// Returns an error if the URL is invalid or uses an unsupported scheme.
-fn normalize_bam_url(url_str: &str) -> Result<String, BamUrlError> {
+pub fn normalize_bam_url(url_str: &str) -> Result<String, BamUrlError> {
     let url_str = url_str.trim();
     let parse_target = if url_str.contains("://") {
         url_str.to_string()
